@@ -1,0 +1,36 @@
+[project]
+name = "reagent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Manav Goel", email = "manavgoel47@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=0.1",
+    "langchain-community>=0.2",
+    "langchain-ollama>=0.1",
+    "langchain-openai>=0.1",
+    "nltk>=3.8",
+    "torch==2.4.0+cu121",
+    "tool-router @ git+https://github.com/Deep-Parekh/tool-router.git",
+]
+
+[project.scripts]
+reagent = "reagent:main"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
