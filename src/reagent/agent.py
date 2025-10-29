@@ -242,7 +242,10 @@ class LLMTaskPlanner:
             "merge overlapping work into a single task, and never invent file names or directories that are not "
             "listed in the project context. If dependencies need to be added, describe the action generically unless the "
             "specific package name already appears in the project context. The repository uses Python packaging "
-            "(pyproject.toml); avoid suggesting npm/yarn commands or JavaScript-only libraries.\n\n"
+            "(pyproject.toml); avoid suggesting npm/yarn commands or JavaScript-only libraries. "
+            "Important: include a version-control safety requirement — create or switch to a dedicated feature branch "
+            "(e.g., 'feat/<short-slug>') at the start, and after each major implementation step ensure the plan calls out "
+            "to stage, commit, and push changes to that branch so rollbacks are possible.\n\n"
             "Keep the total number of tasks at or below 10.\n\n"
             "Example plan (for a password reset feature) to illustrate the expected structure:\n"
             "[\n"
@@ -418,6 +421,8 @@ Guidelines:
 - Focus recommendations on files from the project context; do not introduce paths outside that list.
 - Describe new dependencies generically unless already mentioned in the project context.
 - Keep the plan concise (7 tasks or fewer when possible) and never exceed 10 tasks; avoid writing code.
+- Add version-control safety: start by creating/switching to a dedicated feature branch (e.g., 'feat/<short-slug>').
+- After each execution step, explicitly stage, commit, and push changes to that branch so incremental rollbacks are possible.
 - Use phases from ['context', 'analysis', 'execution', 'validation'] as appropriate.
 - Return a JSON array of task objects with keys: name, description, phase, depends_on, suggested_command (optional).
 
@@ -615,12 +620,63 @@ class PlanningAgent:
         else:
             logging.info("Final plan verification ok (%d task(s))", len(tasks))
 
+        # Inject branch/commit/push requirements into execution steps without adding new tasks.
+        try:
+            branch = self._feature_branch_name(prompt=clean_prompt, keywords=keywords)
+            tasks = self._inject_branch_commit_requirements(tasks, branch)
+        except Exception as exc:  # pragma: no cover - defensive; should not block planning
+            logging.warning("PlanningAgent could not inject branch/commit requirements: %s", exc)
+
         # Write out a sequential JSON file representation of the plan.
         try:
             self._export_sequential_plan(tasks)
         except Exception as exc:  # pragma: no cover - filesystem could be readonly
             logging.warning("PlanningAgent could not write plan.json: %s", exc)
 
+        return tasks
+
+    def _feature_branch_name(self, prompt: str, keywords: List[str]) -> str:
+        """Derive a concise feature branch name from keywords/prompt.
+
+        Falls back to 'feat/change' when no signal is available.
+        """
+        base_source = "-".join(keywords) if keywords else prompt.lower()
+        # Replace non-alphanumeric with hyphens; collapse and trim.
+        cleaned = re.sub(r"[^a-z0-9]+", "-", base_source.lower())
+        cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+        if not cleaned:
+            cleaned = "change"
+        # Keep reasonably short to avoid long branch names.
+        cleaned = cleaned[:40].strip("-") or "change"
+        return f"feat/{cleaned}"
+
+    def _inject_branch_commit_requirements(self, tasks: List[Task], branch: str) -> List[Task]:
+        """Append branch/commit/push requirements to each execution step.
+
+        - First execution task: also instruct to create/switch to the feature branch.
+        - Every execution task: instruct to stage, commit, and push to the branch.
+        """
+        first_exec_index: Optional[int] = None
+        for idx, task in enumerate(tasks):
+            if task.phase == "execution":
+                first_exec_index = idx
+                break
+        if first_exec_index is not None:
+            first_exec = tasks[first_exec_index]
+            prefix = (
+                f"Create or switch to feature branch '{branch}' to isolate changes. "
+            )
+            if prefix.strip() not in first_exec.description:
+                first_exec.description = f"{prefix}{first_exec.description}".strip()
+
+        commit_suffix = (
+            f" After completing this step, stage, commit, and push to '{branch}' to enable rollbacks."
+        )
+        for task in tasks:
+            if task.phase == "execution":
+                # Avoid duplicating if already present.
+                if "stage, commit, and push" not in task.description.lower():
+                    task.description = f"{task.description.rstrip()}" + commit_suffix
         return tasks
 
     def _build_context_tasks(
@@ -1246,7 +1302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     prompt_text = " ".join(args.prompt).strip() if args.prompt else ""
     if not prompt_text:
-        prompt_text = "Add password reset with token expiry"
+        prompt_text = "Design a Login page using only HTML and JavaScript"
         logging.info("No prompt provided; using sample query: %s", prompt_text)
 
     agent = PlanningAgent()
