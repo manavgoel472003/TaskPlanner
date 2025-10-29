@@ -148,6 +148,4 @@ for t in tasks:
 - Logging is on by default at INFO; raise to DEBUG for more detail.
 - Tests are not included; you can run `pytest` where relevant in your repo.
 
-## License
-No license file is provided. Add one if you intend to distribute.
 

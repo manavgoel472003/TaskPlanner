@@ -68,10 +68,16 @@ class CodeContextBuilder:
         project_root = root or pathlib.Path(__file__).resolve().parents[2]
         self._root = project_root
         self._src_root = self._root / "src"
+        logging.info(
+            "CodeContextBuilder initialised (root=%s, src=%s)", self._root, self._src_root
+        )
 
     def build_snapshot(self, keywords: Sequence[str], limit: int = 5) -> List[CodeMatch]:
         matches: List[CodeMatch] = []
         normalized = [kw.lower() for kw in keywords]
+        logging.info(
+            "Building code context snapshot (keywords=%s, limit=%d)", normalized, limit
+        )
         for path in self._iter_candidate_files():
             try:
                 text = path.read_text(encoding="utf-8", errors="ignore")
@@ -98,10 +104,16 @@ class CodeContextBuilder:
                 break
 
         if matches:
+            logging.info("Snapshot discovery produced %d match(es)", len(matches))
             return matches
 
         # Fallback: return high-level structure hints.
-        return self._fallback_structure(limit)
+        fallback = self._fallback_structure(limit)
+        logging.info(
+            "No keyword matches found; using fallback structure with %d entrie(s)",
+            len(fallback),
+        )
+        return fallback
 
     def format_for_prompt(self, matches: Sequence[CodeMatch]) -> str:
         if not matches:
@@ -110,6 +122,7 @@ class CodeContextBuilder:
             f"- {match.path}:{match.line} â†’ {match.snippet}"
             for match in matches
         ]
+        logging.info("Formatted project context for prompt (%d entrie(s))", len(matches))
         return "\n".join(lines[:10])
 
     def highlight_summary(self, matches: Sequence[CodeMatch]) -> str:
@@ -269,11 +282,11 @@ class LLMTaskPlanner:
             "]\n\n"
             f"Request: {prompt}\n"
             f"High-signal keywords: {keyword_list}\n\n"
-            f"Project context:\n{project_context or 'No relevant files discovered.'}\n\n"
+            f"Project context (files, tools, and hints):\n{project_context or 'No relevant files discovered.'}\n\n"
             "Return the tasks as a JSON array. Each element must contain:\n"
             "  - name: short action title\n"
             "  - description: 1-2 sentence explanation of the action to take\n"
-            "  - phase: one of ['analysis', 'execution', 'validation']\n"
+            "  - phase: one of ['context', 'analysis', 'execution', 'validation']\n"
             "  - depends_on: the exact name of the task whose output feeds this task (omit or null for the first task)\n"
             "  - suggested_command (optional): shell command to kick-start the task\n\n"
             "Respond with JSON only."
@@ -285,13 +298,23 @@ class LLMTaskPlanner:
             len(keywords),
         )
         try:
+            logging.info(
+                "LLMTaskPlanner.generate_tasks dispatching to model (prompt_chars=%d, keywords=%d)",
+                len(prompt),
+                len(keywords),
+            )
             response = self._model.invoke(instructions)
         except Exception as exc:  # pragma: no cover - model may error at runtime
             logging.warning("PlanningAgent planning LLM call failed: %s", exc)
             return []
 
         content = self._extract_content(response)
-        return self._parse_task_json(content)
+        logging.info(
+            "LLMTaskPlanner received response (chars=%d)", len(content) if isinstance(content, str) else -1
+        )
+        tasks = self._parse_task_json(content)
+        logging.info("LLMTaskPlanner parsed %d task(s)", len(tasks))
+        return tasks
 
     @property
     def model(self) -> Optional[ChatOllama]:
@@ -330,7 +353,7 @@ class LLMTaskPlanner:
         except json.JSONDecodeError:
             return []
 
-        allowed_phases = {"analysis", "execution", "validation"}
+        allowed_phases = {"context", "analysis", "execution", "validation"}
         tasks: List[Task] = []
         for item in payload:
             if not isinstance(item, dict):
@@ -389,29 +412,32 @@ Project context:
 {project_context}
 
 Guidelines:
-- Preserve sequential execution; each task should depend on the previous one.
-- Make tasks explicitly dependent so the output of one feeds directly into the next.
-- Clarify intent and deliverables; remove redundancies.
-- Merge substantially similar tasks.
+- Ensure a strictly sequential flow; each task must depend on the previous one.
+- You may add, remove, split, or merge tasks to improve clarity and correctness.
+- Clarify intent and deliverables; remove redundancies and vague steps.
 - Focus recommendations on files from the project context; do not introduce paths outside that list.
 - Describe new dependencies generically unless already mentioned in the project context.
 - Keep the plan concise (7 tasks or fewer when possible) and never exceed 10 tasks; avoid writing code.
-- Keep the number of tasks unchanged; adjust only descriptions, names, or suggested commands as needed.
-- Preserve each task's phase unless a clear correction is required.
+- Use phases from ['context', 'analysis', 'execution', 'validation'] as appropriate.
 - Return a JSON array of task objects with keys: name, description, phase, depends_on, suggested_command (optional).
 
 Respond with JSON only."""
                 ),
             )
             self._chain = LLMChain(llm=self._model, prompt=template)
+            logging.info("PlanRefiner initialised (LLM chain ready)")
         else:  # pragma: no cover - depends on runtime availability
             self._chain = None
+            logging.info("PlanRefiner initialised (no LLM available)")
 
     def refine(self, tasks: List[Task], prompt: str, project_context: str, rounds: int) -> List[Task]:
         if rounds <= 0 or self._chain is None:
             return tasks
 
         current = tasks
+        logging.info(
+            "PlanRefiner starting (rounds=%d, initial_tasks=%d)", rounds, len(current)
+        )
         model_name = getattr(self._model, "model", "unknown") if self._model else "unavailable"
         for iteration in range(1, rounds + 1):
             payload = [
@@ -448,6 +474,7 @@ Respond with JSON only."""
                 logging.warning("PlanningAgent refinement iteration %d returned no usable tasks", iteration)
                 return current
             current = refined
+        logging.info("PlanRefiner finished (tasks=%d)", len(current))
         return current
 
     @staticmethod
@@ -481,6 +508,11 @@ class PlanningAgent:
         self._context_builder = CodeContextBuilder(self._project_root)
         self._static_tool_catalog: Optional[List[str]] = None
         self._tool_router: Optional["ToolRouterType"] = tool_router or self._create_tool_router(router_config)
+        logging.info(
+            "PlanningAgent initialised (project_root=%s, tool_router=%s)",
+            self._project_root,
+            "enabled" if self._tool_router else "disabled",
+        )
 
     def _create_tool_router(
         self, router_config: Optional["RouterConfigType"]
@@ -488,6 +520,10 @@ class PlanningAgent:
         if ToolRouter is None or RouterConfig is None:
             logging.debug("PlanningAgent running without tool_router integration; dependency not installed.")
             self._static_tool_catalog = self._default_tool_catalog()
+            logging.info(
+                "PlanningAgent using default tool catalog (%d tool(s))",
+                len(self._static_tool_catalog or []),
+            )
             return None
 
         config: Optional["RouterConfigType"] = router_config
@@ -499,17 +535,30 @@ class PlanningAgent:
                 return None
 
         try:
-            return ToolRouter(config)
+            instance = ToolRouter(config)
+            logging.info("PlanningAgent ToolRouter initialised and ready")
+            return instance
         except Exception as exc:  # pragma: no cover - depends on environment setup
             logging.warning("PlanningAgent could not initialise ToolRouter: %s", exc)
             self._static_tool_catalog = self._default_tool_catalog()
+            logging.info(
+                "PlanningAgent falling back to default tool catalog (%d tool(s))",
+                len(self._static_tool_catalog or []),
+            )
             return None
 
     def plan(self, prompt: str, refine_rounds: int = 0) -> List[Task]:
+        logging.info(
+            "PlanningAgent.plan started (refine_rounds=%d)", refine_rounds
+        )
         clean_prompt = prompt.strip()
+        logging.info("Planning prompt length=%d", len(clean_prompt))
         available_tools = self._list_available_tools()
+        logging.info("Available tools discovered: %d", len(available_tools))
         keywords = self._extract_keywords(clean_prompt)
+        logging.info("Extracted keywords: %s", ", ".join(keywords) if keywords else "<none>")
         matches = self._context_builder.build_snapshot(keywords)
+        logging.info("Context matches found: %d", len(matches))
         project_context = self._context_builder.format_for_prompt(matches)
         tools_context = self._format_tools_for_prompt(available_tools)
         if tools_context:
@@ -517,58 +566,62 @@ class PlanningAgent:
                 project_context = f"{project_context}\n\nAvailable tools:\n{tools_context}"
             else:
                 project_context = f"Available tools:\n{tools_context}"
-        tool_anchored = bool(available_tools)
-        if tool_anchored:
-            context_tasks: List[Task] = []
-            action_tasks = self._build_tool_anchored_plan(
-                clean_prompt, keywords, matches, available_tools
-            )
-        else:
-            context_tasks = self._build_context_tasks(clean_prompt, keywords, matches, available_tools)
-            action_tasks = self._build_action_tasks(clean_prompt, keywords, matches, available_tools)
 
+        # Generate the entire plan using the Ollama model only (no heuristics).
+        logging.info("Invoking LLM planner to generate tasks...")
+        action_tasks = self._llm_planner.generate_tasks(
+            clean_prompt, keywords, project_context
+        )
+
+        if not action_tasks:
+            logging.warning("PlanningAgent received no tasks from LLM planner.")
+            return []
+
+        # Optionally refine with the LLM for better sequencing or clarity.
+        tasks = list(action_tasks)
+        logging.info("Initial LLM task count: %d", len(tasks))
         max_refinements = max(0, refine_rounds)
-        if tool_anchored and max_refinements:
-            logging.info(
-                "PlanningAgent skipping LLM refinement to preserve tool-anchored outline."
-            )
-
-        plan_attempt = self._assemble_plan(context_tasks, action_tasks, matches)
-        verified, reason = self._verify_plan(plan_attempt)
-
-        if tool_anchored or max_refinements == 0 or self._refiner is None:
-            if not verified:
-                logging.warning(
-                    "PlanningAgent returning plan that failed verification: %s", reason
+        verified, reason = self._verify_plan(tasks)
+        logging.info(
+            "Initial plan verification: %s%s",
+            "ok" if verified else "failed",
+            "" if verified else f" ({reason})",
+        )
+        if self._refiner is not None:
+            refinements_used = 0
+            # If verification fails and no refinements requested, try one best-effort pass.
+            extra_first_pass = max_refinements == 0 and not verified
+            total_allowed = max_refinements + (1 if extra_first_pass else 0)
+            while refinements_used < total_allowed and (not verified):
+                refinements_used += 1
+                logging.info(
+                    "PlanningAgent running refinement pass (%d/%d): %s",
+                    refinements_used,
+                    total_allowed,
+                    reason or "verification failed",
                 )
-            return plan_attempt
-
-        refinements_used = 0
-        while not verified and refinements_used < max_refinements:
-            refinements_used += 1
-            logging.info(
-                "PlanningAgent verifier requested refinement (%d/%d): %s",
-                refinements_used,
-                max_refinements,
-                reason or "verification failed",
-            )
-            refined_actions = self._refiner.refine(
-                action_tasks,
-                clean_prompt,
-                project_context,
-                rounds=1,
-            )
-            action_tasks = refined_actions
-            plan_attempt = self._assemble_plan(context_tasks, action_tasks, matches)
-            verified, reason = self._verify_plan(plan_attempt)
+                tasks = self._refiner.refine(
+                    tasks,
+                    clean_prompt,
+                    project_context,
+                    rounds=1,
+                )
+                verified, reason = self._verify_plan(tasks)
 
         if not verified:
             logging.warning(
-                "PlanningAgent verifier exhausted refinements; returning plan with warning: %s",
-                reason,
+                "PlanningAgent returning plan that failed verification: %s", reason
             )
+        else:
+            logging.info("Final plan verification ok (%d task(s))", len(tasks))
 
-        return plan_attempt
+        # Write out a sequential JSON file representation of the plan.
+        try:
+            self._export_sequential_plan(tasks)
+        except Exception as exc:  # pragma: no cover - filesystem could be readonly
+            logging.warning("PlanningAgent could not write plan.json: %s", exc)
+
+        return tasks
 
     def _build_context_tasks(
         self,
@@ -1133,4 +1186,74 @@ class PlanningAgent:
         if len(keywords) == 2:
             return f"'{keywords[0]}' and '{keywords[1]}'"
         return f"'{keywords[0]}', '{keywords[1]}', and '{keywords[2]}'"
+
+    def _export_sequential_plan(self, tasks: List[Task], path: Optional[pathlib.Path] = None) -> pathlib.Path:
+        """Write the plan to a JSON file as a sequential list with step numbers.
+
+        The file is written to repo root as 'plan.json' by default.
+        """
+        output_path = path or (self._project_root / "plan.json")
+        payload = [
+            {
+                "step": index,
+                "name": task.name,
+                "description": task.description,
+                "phase": task.phase,
+                "depends_on": task.depends_on,
+                "suggested_command": task.suggested_command,
+            }
+            for index, task in enumerate(tasks, start=1)
+        ]
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        output_path.write_text(text, encoding="utf-8")
+        logging.info("PlanningAgent wrote sequential JSON plan to %s", output_path)
+        return output_path
+
+
+def _print_plan(prompt: str, plan: List[Task]) -> None:
+    print(f'Plan for: "{prompt}"\n')
+    for index, task in enumerate(plan, start=1):
+        print(f"{index}. {task.name}")
+        print(f"   Phase: {task.phase}")
+        if task.depends_on:
+            print(f"   Depends on: {task.depends_on}")
+        print(f"   {task.description}")
+        if task.suggested_command:
+            print(f"   Command hint: {task.suggested_command}")
+        print()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    import argparse as _argparse
+
+    parser = _argparse.ArgumentParser(
+        description="Generate an implementation plan using the Ollama-backed planner."
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Natural-language description of the feature to plan. If omitted, uses a sample query.",
+    )
+    parser.add_argument(
+        "--refine",
+        type=int,
+        default=1,
+        help="Refinement rounds to run with the LLM (default: 1).",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+
+    prompt_text = " ".join(args.prompt).strip() if args.prompt else ""
+    if not prompt_text:
+        prompt_text = "Add password reset with token expiry"
+        logging.info("No prompt provided; using sample query: %s", prompt_text)
+
+    agent = PlanningAgent()
+    plan = agent.plan(prompt_text, refine_rounds=args.refine)
+    _print_plan(prompt_text, plan)
+
+
+if __name__ == "__main__":
+    main()
 
